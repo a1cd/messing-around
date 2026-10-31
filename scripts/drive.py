@@ -5,6 +5,7 @@ Usage:
                             [--manual] [--car sports_car|hatchback] [--assists]
                             [--fps 30] [--no-viewer]
     python scripts/drive.py --headless-test 300 [--seed N] [--no-viewer]
+    python scripts/drive.py --track showcase [--headless-test 300] [--no-viewer]
 
 Keys (see drivesim/README_driving.md):
     A/D or Left/Right  steer        W/Up  gas        S/Down  brake, then reverse
@@ -32,6 +33,7 @@ import numpy as np  # noqa: E402
 
 from drivesim.human import DeviceReader, HumanInput, RawInput  # noqa: E402
 from drivesim.vehicle import Vehicle, hatchback, sports_car  # noqa: E402
+from drivesim.track_script import NAMED_SCRIPTS, build_world_from_script  # noqa: E402
 from drivesim.world import generate_world  # noqa: E402
 
 DT = 1.0 / 30.0
@@ -59,6 +61,8 @@ def parse_args(argv=None):
     p.add_argument("--no-viewer", action="store_true", help="simulate only, no rendering or window")
     p.add_argument("--headless-test", type=int, metavar="N", default=0,
                    help="run N scripted steps without a window and print a summary")
+    p.add_argument("--track", choices=sorted(NAMED_SCRIPTS), default=None,
+                   help="build a named scripted track (e.g. showcase) instead of a generated one")
     p.add_argument("--width", type=int, default=800)
     p.add_argument("--height", type=int, default=500)
     return p.parse_args(argv)
@@ -217,7 +221,10 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.headless_test or args.no_viewer:
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-    terrain, track = generate_world(args.seed, closed=not args.open, difficulty=args.difficulty)
+    if args.track:
+        terrain, track = build_world_from_script(NAMED_SCRIPTS[args.track], seed=args.seed)
+    else:
+        terrain, track = generate_world(args.seed, closed=not args.open, difficulty=args.difficulty)
     car = make_car(args, terrain, track)
     if args.headless_test:
         return run_headless(args, terrain, track, car)

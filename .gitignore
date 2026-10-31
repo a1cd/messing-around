@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 *.png
 .venv/
+.claude/worktrees/
