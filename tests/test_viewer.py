@@ -157,3 +157,86 @@ def test_fps_measurement(world, viewer):
     print("\nviewer fps (render only, 800x500):", {k: round(v, 1) for k, v in fps.items()})
     # sanity floor only; the target is >= 30 fps on a laptop CPU
     assert min(fps.values()) >= 15.0
+
+
+
+# ------------------------------------------------------------ wheel geometry
+ORIENTATIONS = ("level", "roll30", "roll-30", "pitch15", "upside_down", "flipped")
+
+
+def _set_orientation(car, terrain, name):
+    """Set an orientation and step once. Setting car.q alone leaves the hubs stale until a step."""
+    deg = {"level": 0.0, "roll30": 30.0, "roll-30": -30.0, "pitch15": 0.0,
+           "upside_down": 170.0, "flipped": 180.0}[name]
+    a = np.radians(deg)
+    if name == "pitch15":
+        car.q = [np.cos(a / 2 + np.radians(15) / 2), 0.0, np.sin(np.radians(15) / 2), 0.0]
+    elif name == "level":
+        pass
+    else:
+        car.q = [np.cos(a / 2), np.sin(a / 2), 0.0, 0.0]
+    car.step(Controls(), 1 / 30, terrain)
+
+
+@pytest.mark.parametrize("name", ORIENTATIONS)
+def test_wheel_geometry_matches_vehicle_hubs(world, viewer, name):
+    """Drawn wheels sit on wheel_positions_world() and the hub offsets match the hardpoints."""
+    from drivesim.viewer import CAR_BOXES, TIRE_CAP, TIRE_SIDE, WHEEL_SIDES, _Camera, _quat_axes
+
+    terrain, _ = world
+    car = _start_car(world)
+    _set_orientation(car, terrain, name)
+    X, Y, Z = _quat_axes(car.quaternion)
+    M = np.stack([X, Y, Z], axis=1)
+    hubs = np.asarray(car.wheel_positions_world(), float)
+    local = (hubs - car.position) @ M               # hub offsets in the body frame
+
+    p = car.p
+    rear = -(p.wheelbase - p.cg_to_front)
+    expect_x = np.array([p.cg_to_front, p.cg_to_front, rear, rear])
+    expect_y = np.array([p.track_front, -p.track_front, p.track_rear, -p.track_rear]) / 2
+    assert np.allclose(local[:, 0], expect_x, atol=0.05), local
+    assert np.allclose(local[:, 1], expect_y, atol=0.05), local
+    assert np.all(np.abs(local[:, 2]) < 0.6), local
+
+    faces = viewer._car_faces(car.position, (X, Y, Z), car)
+    caps = [pts for pts, n, col in faces if col == TIRE_CAP]
+    sides = [pts for pts, n, col in faces if col == TIRE_SIDE]
+    assert len(caps) == 8 and len(sides) == 4 * WHEEL_SIDES
+    for i in range(4):
+        cap_pair = caps[2 * i:2 * i + 2]
+        mid = (cap_pair[0].mean(0) + cap_pair[1].mean(0)) / 2.0
+        assert np.allclose(mid, hubs[i], atol=1e-9), (name, i)
+        side_mean = np.concatenate(sides[i * WHEEL_SIDES:(i + 1) * WHEEL_SIDES]).mean(0)
+        assert np.allclose(side_mean, hubs[i], atol=1e-6), (name, i)
+
+    # screen position of the drawn wheel centre equals the projection of the hub
+    cam = _Camera(car.position + X * -6 + Z * 3, X, Z, 300.0, W / 2, H / 2)
+    for i in range(4):
+        drawn = (caps[2 * i].mean(0) + caps[2 * i + 1].mean(0)) / 2.0
+        assert np.allclose(cam.project(cam.to_cam(drawn)), cam.project(cam.to_cam(hubs[i])))
+
+    # steered front wheels: axle = cross(Z, rolling direction), rolling dir = X rotated by steer
+    steer = car.wheel_steer_angles
+    for i in (0, 1):
+        d = steer[i]
+        f = np.cos(d) * X + np.sin(d) * Y
+        axle = np.cross(Z, f)
+        axle = axle / np.linalg.norm(axle)
+        cap_normal = np.cross(Z, f)  # same direction as the drawn cap normal (up to sign)
+        assert abs(abs(np.dot(axle, cap_normal / np.linalg.norm(cap_normal))) - 1.0) < 1e-9
+
+
+def test_upside_down_wheels_are_above_body_centre(world):
+    """Upside down, the wheel hubs are above the centre of gravity in world coordinates."""
+    from drivesim.viewer import _quat_axes
+    terrain, _ = world
+    car = _start_car(world)
+    _set_orientation(car, terrain, "flipped")
+    X, Y, Z = _quat_axes(car.quaternion)
+    local = (car.wheel_positions_world() - car.position) @ np.stack([X, Y, Z], axis=1)
+    assert car.is_flipped()
+    assert np.allclose(local[:, 0], [1.25, 1.25, -1.35, -1.35], atol=0.05)
+    # the body's -Z axis points up in the world, so the wheels are above the centre of gravity
+    assert np.all(local[:, 2] < 0.0)
+    assert np.all(car.wheel_positions_world()[:, 2] > car.position[2])

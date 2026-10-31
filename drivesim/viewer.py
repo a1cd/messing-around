@@ -386,18 +386,19 @@ class Viewer:
             pygame.draw.line(surf, colour, p, q, width)
 
     # ------------------------------------------------------------ the car
-    def _draw_car(self, surf, cam, car_pos, axes, vehicle):
+    def _car_faces(self, car_pos, axes, vehicle):
+        """All car faces in world coordinates: list of (points (k,3), outward normal, base colour).
+
+        Body boxes come from CAR_BOXES in body axes. Each wheel is a 12-sided prism (tyre) whose
+        rolling direction is the body X axis rotated by the road-wheel steer angle, with a spoke
+        on each cap that rotates with the integrated spin angle. The hub is the wheel centre.
+        """
         X, Y, Z = axes
         M = np.stack([X, Y, Z], axis=1)     # body -> world
-        prims = []                          # (depth, world points (k,3), colour)
+        faces = []
 
-        def add_face(world_pts, normal, colour, cam_pos_):
-            centre = world_pts.mean(0)
-            if np.dot(normal, cam_pos_ - centre) <= 0.0:
-                return
-            shade = 0.5 + 0.5 * max(float(np.dot(normal, LIGHT)), 0.0)
-            col = tuple(int(c * shade) for c in colour)
-            prims.append((world_pts, col))
+        def add(world_pts, normal, colour):
+            faces.append((np.asarray(world_pts, float), np.asarray(normal, float), colour))
 
         def box_faces(lo, hi, colour):
             lo = np.asarray(lo, float)
@@ -418,11 +419,9 @@ class Viewer:
                         corners.append(p)
                     yield np.array(corners), nloc, colour
 
-        cam_pos = cam.pos
         for lo, hi, colour in CAR_BOXES:
             for loc_pts, nloc, col in box_faces(lo, hi, colour):
-                wp = car_pos + loc_pts @ M.T
-                add_face(wp, M @ nloc, col, cam_pos)
+                add(car_pos + loc_pts @ M.T, M @ nloc, col)
 
         hubs = np.asarray(vehicle.wheel_positions_world(), float).reshape(4, 3)
         steer = np.asarray(vehicle.wheel_steer_angles, float).reshape(4)
@@ -439,11 +438,9 @@ class Viewer:
             axle = _unit(np.cross(Z, f))                    # lateral axis of this wheel
             rim_dir = np.cos(ang)[:, None] * f + np.sin(ang)[:, None] * Z
             hub = hubs[i]
-            rim = hub + radius * rim_dir                    # (S, 3)
             for side in (1.0, -1.0):
                 off = hub + side * hw * axle
-                add_face(off + radius * rim_dir, side * axle, TIRE_CAP, cam_pos)
-                # spoke on the cap, rotating with wheel spin
+                add(off + radius * rim_dir, side * axle, TIRE_CAP)
                 sp = math.cos(spin[i]) * f + math.sin(spin[i]) * Z
                 lat = _unit(np.cross(axle, sp))
                 sp_pts = np.array([
@@ -452,18 +449,26 @@ class Viewer:
                     off - 0.9 * radius * sp - 0.05 * radius * lat,
                     off - 0.9 * radius * sp + 0.05 * radius * lat,
                 ])
-                add_face(sp_pts, side * axle, SPOKE, cam_pos)
-            for s in range(WHEEL_SIDES):
-                a_, b_ = s, (s + 1) % WHEEL_SIDES
+                add(sp_pts, side * axle, SPOKE)
+            for s_ in range(WHEEL_SIDES):
+                a_, b_ = s_, (s_ + 1) % WHEEL_SIDES
                 quad = np.array([
                     hub + hw * axle + radius * rim_dir[a_],
                     hub + hw * axle + radius * rim_dir[b_],
                     hub - hw * axle + radius * rim_dir[b_],
                     hub - hw * axle + radius * rim_dir[a_],
                 ])
-                nrad = (rim_dir[a_] + rim_dir[b_])
-                nrad = _unit(nrad)
-                add_face(quad, nrad, TIRE_SIDE, cam_pos)
+                add(quad, _unit(rim_dir[a_] + rim_dir[b_]), TIRE_SIDE)
+        return faces
+
+    def _draw_car(self, surf, cam, car_pos, axes, vehicle):
+        prims = []
+        for pts, normal, colour in self._car_faces(car_pos, axes, vehicle):
+            centre = pts.mean(0)
+            if np.dot(normal, cam.pos - centre) <= 0.0:     # back-face cull
+                continue
+            shade = 0.5 + 0.5 * max(float(np.dot(normal, LIGHT)), 0.0)
+            prims.append((pts, tuple(int(c * shade) for c in colour)))
 
         # project, cull behind the near plane, painter's sort
         polys, depths, cols = [], [], []
