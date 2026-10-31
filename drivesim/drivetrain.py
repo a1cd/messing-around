@@ -91,6 +91,7 @@ class Powertrain:
         self.shift_timer = 0.0
         self.engage = 0.0
         self.hold_timer = 0.0
+        self.brake_latched = False
 
     # ----------------------------------------------------------- gear ratios
     def ratio(self) -> float:
@@ -147,9 +148,9 @@ class Powertrain:
         if up and not down:
             target = {-1: 0, 0: 1}.get(g, min(6, g + 1))
         elif down and not up:
-            target = {0: -1, 1: 0}.get(g, g - 1 if g >= 2 else g)
             if g == -1:
-                target = -1
+                return
+            target = {0: -1, 1: 0}.get(g, g - 1)
         else:  # both pressed: ignore
             return
         if target != g:
@@ -189,24 +190,25 @@ class Powertrain:
 
         # ================= automatic transmission =================
         moving_slow = abs(v_long) < self.STANDSTILL_SPEED
-        # --- reverse selection by holding the brake at standstill (see module docs)
-        if moving_slow and self.shift_timer <= 0.0:
-            if brake > 0.5 and throttle < 0.05 and self.gear != -1:
-                self.hold_timer += h
-                if self.hold_timer >= self.AUTO_REVERSE_HOLD_TIME:
-                    self._instant_gear(-1)
-                    self.hold_timer = 0.0
-                    return
-            elif self.gear == -1 and throttle > 0.2:
-                self._instant_gear(1)
-                return
-            else:
+        # --- direction toggle: hold the brake at standstill for AUTO_REVERSE_HOLD_TIME to flip D <-> R.
+        # The brake must be released before the next toggle (a latch prevents repeated flipping).
+        if brake < 0.05:
+            self.hold_timer = 0.0
+            self.brake_latched = False
+        elif (moving_slow and self.shift_timer <= 0.0 and throttle < 0.05
+              and not self.brake_latched):
+            self.hold_timer += h
+            if self.hold_timer >= self.AUTO_REVERSE_HOLD_TIME:
+                self._instant_gear(-1 if self.gear != -1 else 1)
                 self.hold_timer = 0.0
+                self.brake_latched = True
+                return
         else:
             self.hold_timer = 0.0
 
         # --- gear selection (forward gears only)
-        if self.shift_timer <= 0.0 and self.engine_on and self.gear >= 1:
+        # only shift while the clutch is engaged, otherwise the engine has not followed the gears
+        if self.shift_timer <= 0.0 and self.engine_on and self.gear >= 1 and self.engage > 0.95:
             rpm = self.engine_w * RPM_PER_RADS
             if self.gear < 6 and rpm > self.AUTO_UPSHIFT_BASE + self.AUTO_UPSHIFT_SPAN * throttle:
                 self._start_shift(self.gear + 1)
@@ -228,6 +230,10 @@ class Powertrain:
                 target = 1.0
             elif self.engine_w > 1.1 * self.idle_w:
                 target = min(1.0, 1.3 * throttle)
+        if self.engine_w < 1.1 * self.idle_w:
+            # engine about to stall (e.g. locked wheels dragging it down): open the clutch at once
+            self.engage = 0.0
+            return
         if target > self.engage:
             self.engage = min(target, self.engage + self.AUTO_ENGAGE_UP_RATE * h)
         else:
