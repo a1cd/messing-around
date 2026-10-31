@@ -50,6 +50,7 @@ from gymnasium import spaces
 
 from .reward import RewardCalculator, RewardConfig
 from .vehicle import Controls, Vehicle, VehicleParams, PRESETS
+from .terrain import SURFACE_FRICTION
 from .world import generate_world
 
 # ---------------------------------------------------------------------------
@@ -122,6 +123,154 @@ def build_world(seed: int, closed: bool = True, difficulty: float = 0.5):
 def _rot_local(dx, dy, yaw):
     c, s = math.cos(yaw), math.sin(yaw)
     return c * dx + s * dy, -s * dx + c * dy
+
+
+class _FastTerrain:
+    """Lean stand-in for :class:`drivesim.terrain.Terrain` used for the vehicle's per-substep
+    queries (``height_at``, ``normal_at``, ``surface_at``).
+
+    The vehicle queries 4 (or 8) points per substep. For such small finite inputs the
+    bilinear lookups are done in plain Python floats, with the same operations in the same
+    order as the Terrain methods, so results are bit-identical. Larger or non-finite inputs,
+    and shape mismatches, go through the numpy path or the wrapped terrain.
+    """
+
+    _SMALL = 16
+
+    def __init__(self, terrain):
+        self._t = terrain
+        # row-major flat views: index = iy * n + ix. memoryview indexing returns Python scalars.
+        self._hf = memoryview(np.ascontiguousarray(terrain.heights, dtype=float).reshape(-1))
+        self._sf = memoryview(np.ascontiguousarray(terrain.surface_ids, dtype=np.uint8).reshape(-1))
+        self._fr = [float(v) for v in SURFACE_FRICTION]
+        self._o = float(terrain.origin)
+        self._r = float(terrain.resolution)
+        self._n = int(terrain.n)
+
+    # -- scalar kernels (finite python floats) ---------------------------------
+    def _h1(self, xv, yv):
+        n, o, r = self._n, self._o, self._r
+        nm1 = n - 1
+        fx = (xv - o) / r
+        fx = 0.0 if fx < 0.0 else (nm1 if fx > nm1 else fx)
+        fy = (yv - o) / r
+        fy = 0.0 if fy < 0.0 else (nm1 if fy > nm1 else fy)
+        ix = int(fx)
+        if ix > n - 2:
+            ix = n - 2
+        iy = int(fy)
+        if iy > n - 2:
+            iy = n - 2
+        tx = fx - ix
+        ty = fy - iy
+        hf = self._hf
+        k = iy * n + ix
+        h00 = hf[k]
+        h01 = hf[k + 1]
+        h10 = hf[k + n]
+        h11 = hf[k + n + 1]
+        top = h00 + (h01 - h00) * tx
+        bot = h10 + (h11 - h10) * tx
+        return top + (bot - top) * ty
+
+    def _s1(self, xv, yv):
+        n, o, r = self._n, self._o, self._r
+        ix = int(round((xv - o) / r))
+        ix = 0 if ix < 0 else (n - 1 if ix > n - 1 else ix)
+        iy = int(round((yv - o) / r))
+        iy = 0 if iy < 0 else (n - 1 if iy > n - 1 else iy)
+        return self._fr[self._sf[iy * n + ix]]
+
+    @staticmethod
+    def _small(x, y):
+        """Flattened python lists for small finite inputs, else None."""
+        if x.size > _FastTerrain._SMALL or x.shape != y.shape:
+            return None
+        xl = x.reshape(-1).tolist()
+        yl = y.reshape(-1).tolist()
+        if not math.isfinite(sum(xl) + sum(yl)):     # any NaN/inf (or overflow) -> numpy path
+            return None
+        return xl, yl
+
+    # -- public queries ---------------------------------------------------------
+    def height_at(self, x, y):
+        x = np.asarray(x, float)
+        y = np.asarray(y, float)
+        small = self._small(x, y)
+        if small is None:
+            if x.shape != y.shape:
+                return self._t.height_at(x, y)
+            return self._height_np(x, y)
+        xl, yl = small
+        out = [self._h1(a, b) for a, b in zip(xl, yl)]
+        if x.ndim == 0:
+            return out[0]
+        return np.array(out, dtype=float).reshape(x.shape)
+
+    def _height_np(self, x, y):
+        n, o, r = self._n, self._o, self._r
+        fx = np.clip((x - o) / r, 0.0, n - 1)
+        fy = np.clip((y - o) / r, 0.0, n - 1)
+        ix = np.minimum(np.floor(fx).astype(int), n - 2)
+        iy = np.minimum(np.floor(fy).astype(int), n - 2)
+        tx = fx - ix
+        ty = fy - iy
+        h = self._t.heights
+        h00 = h[iy, ix]
+        h01 = h[iy, ix + 1]
+        h10 = h[iy + 1, ix]
+        h11 = h[iy + 1, ix + 1]
+        top = h00 + (h01 - h00) * tx
+        bot = h10 + (h11 - h10) * tx
+        out = top + (bot - top) * ty
+        return float(out) if out.ndim == 0 else out
+
+    def normal_at(self, x, y):
+        x = np.asarray(x, float)
+        y = np.asarray(y, float)
+        small = self._small(x, y)
+        if small is None:
+            if x.shape != y.shape:
+                return self._t.normal_at(x, y)
+            return self._normal_np(x, y)
+        xl, yl = small
+        e = self._r
+        e2 = 2 * e
+        h1 = self._h1
+        rows = []
+        for a, b in zip(xl, yl):
+            dzdx = (h1(a + e, b) - h1(a - e, b)) / e2
+            dzdy = (h1(a, b + e) - h1(a, b - e)) / e2
+            nx, ny = -dzdx, -dzdy
+            nrm = math.sqrt(nx * nx + ny * ny + 1.0)
+            rows.append((nx / nrm, ny / nrm, 1.0 / nrm))
+        return np.array(rows, dtype=float).reshape(x.shape + (3,))
+
+    def _normal_np(self, x, y):
+        e = self._r
+        dzdx = (self.height_at(x + e, y) - self.height_at(x - e, y)) / (2 * e)
+        dzdy = (self.height_at(x, y + e) - self.height_at(x, y - e)) / (2 * e)
+        normal = np.stack([-dzdx, -dzdy, np.ones_like(dzdx)], axis=-1)
+        return normal / np.sqrt(np.add.reduce(normal * normal, axis=-1, keepdims=True))
+
+    def surface_at(self, x, y):
+        """Friction multiplier at (x, y), as :meth:`Terrain.surface_at`."""
+        x = np.asarray(x, float)
+        y = np.asarray(y, float)
+        small = self._small(x, y)
+        if small is None:
+            if x.shape != y.shape:
+                return self._t.surface_at(x, y)
+            n, o, r = self._n, self._o, self._r
+            ix = np.clip(np.rint((x - o) / r).astype(int), 0, n - 1)
+            iy = np.clip(np.rint((y - o) / r).astype(int), 0, n - 1)
+            out = SURFACE_FRICTION[self._t.surface_ids[iy, ix]]
+            return float(out) if out.ndim == 0 else out
+        xl, yl = small
+        out = [self._s1(a, b) for a, b in zip(xl, yl)]
+        if x.ndim == 0:
+            return out[0]
+        return np.array(out, dtype=float).reshape(x.shape)
 
 
 class DriveEnv(gym.Env):
@@ -229,6 +378,8 @@ class DriveEnv(gym.Env):
         self.car = Vehicle(self.vehicle_params, transmission=transmission)
         self.reward_calc = RewardCalculator(self.reward_cfg)
         self.terrain = None
+        self._ground_src = None
+        self._ground_obj = None
         self.track = None
         self._viewer = None
         self._last_reward = 0.0
@@ -257,7 +408,7 @@ class DriveEnv(gym.Env):
             raise RuntimeError("generated track does not match closed flag")
 
         start, yaw = self.track.start_pose()
-        self.car.reset(start[:2], yaw, self.terrain)
+        self.car.reset(start[:2], yaw, self._ground)
         self._steps = 0
         self._dist = 0.0              # unwrapped centerline distance travelled (m)
         self._best = 0.0
@@ -284,7 +435,7 @@ class DriveEnv(gym.Env):
         """
         s = float(s)
         xyz, heading = self.track.point_at(s)
-        self.car.reset(xyz[:2], float(heading), self.terrain)
+        self.car.reset(xyz[:2], float(heading), self._ground)
         pr = self.track.project(self.car.position[:2], None)
         self._pr = pr
         self._idx = pr.index
@@ -337,7 +488,7 @@ class DriveEnv(gym.Env):
             ctrl = Controls(steer=steer, throttle=throttle, brake=b, handbrake=hb,
                             clutch=clutch, shift_up=(up_req and k == 0),
                             shift_down=(down_req and k == 0))
-            self.car.step(ctrl, self.dt, self.terrain)
+            self.car.step(ctrl, self.dt, self._ground)
             self._time_since_best += self.dt
             r, terms, reason = self._physics_reward(steer, throttle, b)
             total += r
@@ -399,54 +550,69 @@ class DriveEnv(gym.Env):
         return dist <= self.goal_radius and pr.s >= self.track.length - 3.0 * self.goal_radius
 
     # ------------------------------------------------------------ observation
+    @property
+    def _ground(self):
+        """Fast terrain proxy for the current ``self.terrain`` (rebuilt if it was replaced)."""
+        t = self.terrain
+        if t is not self._ground_src:
+            self._ground_src = t
+            self._ground_obj = None if t is None else _FastTerrain(t)
+        return self._ground_obj
+
     def _obs(self) -> np.ndarray:
         car, track, pr = self.car, self.track, self._pr
+        pos = car.position
+        px, py = float(pos[0]), float(pos[1])
         yaw = car.yaw
+        c, sn = math.cos(yaw), math.sin(yaw)
         s = pr.s
         L = track.length
-        steer_max_low = self.vehicle_params.steer_max_low
-        cw = self.vehicle_params.steer_max_high
-        fr = car.wheel_steer_angles
-        parts = [
-            [car.forward_speed / VEL_SCALE, car.lateral_speed / VEL_SCALE,
-             car.yaw_rate / YAW_RATE_SCALE, car.body_slip_angle / 0.5,
-             car.engine_rpm / RPM_SCALE, car.gear / 6.0,
-             car.longitudinal_accel / ACC_SCALE, car.lateral_accel / ACC_SCALE],
-            np.clip(car.wheel_slip_ratios, -2.0, 2.0),
-            np.clip(car.wheel_slip_angles / 0.5, -3.0, 3.0),
-            [(0.5 * (fr[0] + fr[1])) / steer_max_low],
-            self._last_action,
-        ]
-        d = np.array(LOOKAHEAD_DISTANCES, dtype=float)
-        xyz, _ = track.point_at(s + d)
-        fwd, left = _rot_local(xyz[:, 0] - car.position[0], xyz[:, 1] - car.position[1], yaw)
-        parts.append(np.clip(np.column_stack([fwd, left]).reshape(-1) / LOOK_SCALE, -2.0, 2.0))
         half = track.half_width
-        parts.append([pr.lateral / half, _wrap_angle(track.heading[pr.index] - yaw) / math.pi])
-        cd = np.array(CURVATURE_DISTANCES, dtype=float)
-        parts.append(np.clip(track.curvature_at(s + cd) * CURV_REF, -3.0, 3.0))
-        wp = car.wheel_positions_world()
-        parts.append(self._friction(wp))
-        parts.append(car.wheel_in_contact.astype(float))
+        clip = _clip
+        vl = car.velocity_local                   # one body-frame transform for speeds and slip
+        fwd_v, lat_v = float(vl[0]), float(vl[1])
+        vals = [
+            fwd_v / VEL_SCALE, lat_v / VEL_SCALE,
+            car.yaw_rate / YAW_RATE_SCALE, math.atan2(lat_v, fwd_v) / 0.5,
+            car.engine_rpm / RPM_SCALE, car.gear / 6.0,
+            car.longitudinal_accel / ACC_SCALE, car.lateral_accel / ACC_SCALE,
+        ]
+        vals += [clip(v, -2.0, 2.0) for v in car.wheel_slip_ratios.tolist()]
+        vals += [clip(v / 0.5, -3.0, 3.0) for v in car.wheel_slip_angles.tolist()]
+        fr = car.wheel_steer_angles
+        vals.append((0.5 * (fr[0] + fr[1])) / self.vehicle_params.steer_max_low)
+        la = self._last_action
+        vals += [float(la[0]), float(la[1]), float(la[2]), float(la[3]), float(la[4])]
+        # lookahead: centreline points at s + d, in the car frame
+        point_s = track._point_scalar
+        for d in LOOKAHEAD_DISTANCES:
+            x, y, _, _ = point_s(s + d)
+            dx, dy = x - px, y - py
+            vals.append(clip((c * dx + sn * dy) / LOOK_SCALE, -2.0, 2.0))
+            vals.append(clip((-sn * dx + c * dy) / LOOK_SCALE, -2.0, 2.0))
+        vals.append(pr.lateral / half)
+        vals.append(_wrap_angle(track._l_head[pr.index] - yaw) / math.pi)
+        curv = track._curvature_scalar
+        for d in CURVATURE_DISTANCES:
+            vals.append(clip(curv(s + d) * CURV_REF, -3.0, 3.0))
+        vals += self._friction(car.wheel_positions_world()).tolist()
+        vals += car.wheel_in_contact.astype(float).tolist()
+        vals += [s / L, self._dist / L, 1.0 if track.closed else 0.0]
         if track.closed:
-            goal_vec = [0.0, 0.0]
-            goal_dist = 0.0
+            vals += [0.0, 0.0, 0.0]
         else:
             g = track.goal
-            gf, gl = _rot_local(g[0] - car.position[0], g[1] - car.position[1], yaw)
-            goal_vec = [gf / 100.0, gl / 100.0]
-            goal_dist = math.hypot(g[0] - car.position[0], g[1] - car.position[1]) / L
-        parts.append([s / L, self._dist / L, 1.0 if track.closed else 0.0])
-        parts.append(goal_vec)
-        parts.append([goal_dist, 1.0 if abs(pr.lateral) <= half else 0.0])
-        flat = np.concatenate([np.asarray(p, dtype=np.float64).reshape(-1) for p in parts])
-        out = np.clip(np.nan_to_num(flat, nan=0.0, posinf=OBS_CLIP, neginf=-OBS_CLIP),
-                      -OBS_CLIP, OBS_CLIP).astype(np.float32)
-        return out
+            gf, gl = _rot_local(g[0] - px, g[1] - py, yaw)
+            vals += [gf / 100.0, gl / 100.0,
+                     math.hypot(g[0] - px, g[1] - py) / L]
+        vals.append(1.0 if abs(pr.lateral) <= half else 0.0)
+        flat = np.array(vals, dtype=np.float64)
+        return np.clip(np.nan_to_num(flat, nan=0.0, posinf=OBS_CLIP, neginf=-OBS_CLIP),
+                       -OBS_CLIP, OBS_CLIP).astype(np.float32)
 
     def _friction(self, wheel_xyz):
-        ids = self.terrain.surface_at(wheel_xyz[:, 0], wheel_xyz[:, 1])
-        return np.asarray(ids, dtype=float).reshape(-1)
+        return np.asarray(self._ground.surface_at(wheel_xyz[:, 0], wheel_xyz[:, 1]),
+                          dtype=float).reshape(-1)
 
     def _info(self, extra=None):
         car = self.car
@@ -502,6 +668,11 @@ class DriveEnv(gym.Env):
 
 def _wrap_angle(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _clip(v, lo, hi):
+    """Scalar clip with NaN propagation (matches np.clip for floats)."""
+    return min(max(v, lo), hi)
 
 
 try:  # register Drive-v0; re-registration of the same id is ignored

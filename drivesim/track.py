@@ -29,6 +29,7 @@ Public API
 """
 from __future__ import annotations
 
+import math
 from typing import NamedTuple, Optional, Union
 
 import numpy as np
@@ -148,6 +149,23 @@ class Track:
 
         self._xy = P[:, :2].copy()
         self._tree = cKDTree(self._xy)
+
+        # Precomputed tables for the scalar fast paths (project / point_at / curvature_at).
+        # Python lists avoid numpy scalar overhead; the padded xy arrays turn the hint window
+        # into a contiguous slice (pad index j holds sample j - LOCAL_WINDOW, wrapped for closed
+        # tracks and clamped for open ones, exactly as _nearest_index indexes it).
+        self._l_x = P[:, 0].tolist()
+        self._l_y = P[:, 1].tolist()
+        self._l_z = P[:, 2].tolist()
+        self._l_head = self._th.tolist()
+        self._l_ux = self.tangent[:, 0].tolist()
+        self._l_uy = self.tangent[:, 1].tolist()
+        self._l_k = self.curvature.tolist()
+        W = LOCAL_WINDOW
+        pad = np.arange(-W, N + W)
+        pad = pad % N if closed else np.clip(pad, 0, N - 1)
+        self._pad_x = P[pad, 0].copy()
+        self._pad_y = P[pad, 1].copy()
 
     # ----------------------------------------------------------- construction
     @classmethod
@@ -280,18 +298,48 @@ class Track:
             ``previous.index``). Gives an O(1) local search, falling back to a
             global KD-tree search when the car is far from the hint.
         """
-        p = np.asarray(pos, dtype=float).reshape(-1)[:2]
-        idx = self._nearest_index(p, hint)
-        r = self._refine(p[None, :], np.array([idx]))
-        return Projection(
-            index=int(idx),
-            s=float(r["s"][0]),
-            progress=float(r["s"][0] / self.length),
-            lateral=float(r["lateral"][0]),
-            heading=float(r["heading"][0]),
-            point=r["point"][0].copy(),
-            on_track=bool(r["on_track"][0]),
-        )
+        if isinstance(pos, np.ndarray) and pos.ndim == 1:
+            px, py = float(pos[0]), float(pos[1])
+        else:
+            p = np.asarray(pos, dtype=float).reshape(-1)
+            px, py = float(p[0]), float(p[1])
+        idx = self._nearest_scalar(px, py, hint)
+        return self._refine_scalar(px, py, idx)
+
+    def _point_scalar(self, s: float):
+        """Scalar :meth:`point_at`: returns ``(x, y, z, heading)`` as Python floats."""
+        N, ds, L = self.n, self.spacing, self.length
+        if self.closed:
+            f = (s % L) / ds
+            fl = math.floor(f)
+            i0 = int(fl) % N
+            t = f - fl
+            i1 = (i0 + 1) % N
+        else:
+            f = min(max(s, 0.0), L) / ds
+            i0 = min(int(math.floor(f)), N - 2)
+            t = f - i0
+            i1 = i0 + 1
+        X, Y, Z = self._l_x, self._l_y, self._l_z
+        return (X[i0] + t * (X[i1] - X[i0]), Y[i0] + t * (Y[i1] - Y[i0]),
+                Z[i0] + t * (Z[i1] - Z[i0]), self._l_head[i0])
+
+    def _curvature_scalar(self, s: float) -> float:
+        """Scalar :meth:`curvature_at`."""
+        N, ds, L = self.n, self.spacing, self.length
+        if self.closed:
+            f = (s % L) / ds
+            fl = math.floor(f)
+            i0 = int(fl) % N
+            t = f - fl
+            i1 = (i0 + 1) % N
+        else:
+            f = min(max(s, 0.0), L) / ds
+            i0 = min(int(math.floor(f)), N - 2)
+            t = f - i0
+            i1 = i0 + 1
+        k = self._l_k
+        return k[i0] + t * (k[i1] - k[i0])
 
     def project_many(self, xy):
         """Vectorised global projection of many xy points.
@@ -332,6 +380,82 @@ class Track:
         return np.column_stack([c * dx + s * dy, -s * dx + c * dy])
 
     # --------------------------------------------------------------- internals
+    def _nearest_scalar(self, px: float, py: float, hint):
+        """Scalar version of :meth:`_nearest_index` (same window, same fallbacks)."""
+        if hint is None:
+            _, idx = self._tree.query(np.array([px, py]))
+            return int(idx)
+        N, W = self.n, LOCAL_WINDOW
+        h = int(hint)
+        if self.closed:
+            h %= N
+        elif not 0 <= h < N:
+            return self._nearest_index(np.array([px, py]), hint)
+        dx = self._pad_x[h:h + 2 * W + 1] - px
+        dy = self._pad_y[h:h + 2 * W + 1] - py
+        d2 = dx * dx + dy * dy
+        b = int(np.argmin(d2))
+        j = h - W + b
+        if self.closed:
+            cand = j % N
+            at_track_end = False
+        else:
+            cand = min(max(j, 0), N - 1)
+            at_track_end = cand in (0, N - 1)
+        at_window_edge = b in (0, 2 * W)
+        far = math.sqrt(float(d2[b])) > TRUST_FACTOR * self.width
+        if not ((at_window_edge and not at_track_end) or far):
+            return cand
+        _, idx = self._tree.query(np.array([px, py]))
+        return int(idx)
+
+    def _refine_scalar(self, px: float, py: float, idx: int) -> Projection:
+        """Scalar version of :meth:`_refine` for one point, returning a :class:`Projection`."""
+        N, ds, L = self.n, self.spacing, self.length
+        X, Y, Z = self._l_x, self._l_y, self._l_z
+        if self.closed:
+            prev = (idx - 1) % N
+            nxt = (idx + 1) % N
+        else:
+            prev = max(idx - 1, 0)
+            nxt = min(idx + 1, N - 1)
+
+        def seg(a0, a1):
+            x0, y0 = X[a0], Y[a0]
+            dx, dy = X[a1] - x0, Y[a1] - y0
+            L2 = dx * dx + dy * dy
+            if L2 > 1e-18:
+                t = ((px - x0) * dx + (py - y0) * dy) / L2
+                t = min(max(t, 0.0), 1.0)
+            else:
+                t = 0.0
+            qx, qy = x0 + t * dx, y0 + t * dy
+            ex, ey = px - qx, py - qy
+            return t, qx, qy, math.sqrt(ex * ex + ey * ey)
+
+        tA, qxA, qyA, dA = seg(prev, idx)
+        tB, qxB, qyB, dB = seg(idx, nxt)
+        if dA <= dB:
+            a0, a1, t, qx, qy = prev, idx, tA, qxA, qyA
+        else:
+            a0, a1, t, qx, qy = idx, nxt, tB, qxB, qyB
+        s = (a0 + t) * ds
+        if self.closed:
+            s = s % L
+        th = self._l_head[a0]
+        ux, uy = self._l_ux[a0], self._l_uy[a0]
+        dfx, dfy = px - qx, py - qy
+        lateral = dfx * (-uy) + dfy * ux
+        along = dfx * ux + dfy * uy
+        z = Z[a0] + t * (Z[a1] - Z[a0])
+        on_track = abs(lateral) <= self.half_width
+        if not self.closed:
+            beyond = ((s <= 1e-9) and (along < -1e-9)) or ((s >= L - 1e-9) and (along > 1e-9))
+            on_track = on_track and not beyond
+        return Projection(
+            index=int(idx), s=float(s), progress=float(s / L), lateral=float(lateral),
+            heading=float(th), point=np.array([qx, qy, z], dtype=float), on_track=bool(on_track))
+
     def _nearest_index(self, p, hint):
         if hint is not None:
             N = self.n
