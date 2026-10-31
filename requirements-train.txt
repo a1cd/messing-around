@@ -1,0 +1,7 @@
+# RL training dependencies. Install with: pip install -r requirements-train.txt
+# torch: CPU build is sufficient for this project. For a CPU-only wheel on Linux, first run:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# The line below installs the default PyPI build (may pull large CUDA packages on Linux).
+torch>=2.2
+# Apple Silicon (macOS arm64) only; ignored on other platforms.
+mlx; sys_platform == "darwin" and platform_machine == "arm64"
