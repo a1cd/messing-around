@@ -173,3 +173,18 @@ def test_mlx_backend_one_update_if_available():
     assert np.isfinite(stats["pg_loss"]) and np.isfinite(stats["approx_kl"])
     w = backend.get_weights()
     assert w["actor.0.weight"].shape == (16, venv.observation_dim) and w["log_std"].shape == (3,)
+
+
+def test_export_npz_roundtrip(tmp_path):
+    import pickle
+    import numpy as np
+    from drivesim.rl.ppo import export_npz, numpy_mlp
+
+    ck = pickle.load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoints", "ab_policy.pt"), "rb"))
+    path = str(tmp_path / "p.npz")
+    export_npz(ck, path)
+    z = np.load(path)
+    x = np.random.default_rng(0).normal(size=(3, ck["obs_dim"])).astype(np.float32)
+    w_pkl = numpy_mlp(ck["weights"], "actor", x, int(ck["cfg"]["layers"]))
+    w_npz = numpy_mlp({k: z[k] for k in ck["weights"]}, "actor", x, int(ck["cfg"]["layers"]))
+    assert np.allclose(w_pkl, w_npz, atol=1e-6)

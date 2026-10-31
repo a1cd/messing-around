@@ -136,7 +136,10 @@ def parse_args(argv=None):
     ap.add_argument("--target-kl", type=float, default=None)
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--layers", type=int, default=2)
-    ap.add_argument("--init-log-std", type=float, default=-0.5)
+    ap.add_argument("--init-log-std", type=float, default=None,
+                    help="initial log-std (default -0.5; with --init-from, keeps the checkpoint's value)")
+    ap.add_argument("--init-from", default=None,
+                    help="warm start: weights and observation normaliser from a checkpoint (e.g. bc_pretrain.py output)")
     ap.add_argument("--init-bias", default=None,
                     help="comma list: actor output bias at init per action (steer,throttle,brake)")
     ap.add_argument("--squash", choices=["clip", "tanh"], default="clip")
@@ -177,7 +180,7 @@ def main(argv=None):
         max_grad_norm=args.max_grad_norm, target_kl=args.target_kl, gamma=args.gamma,
         gae_lambda=args.gae_lambda, clip=args.clip, reward_norm=not args.no_reward_norm,
         vf_coef=args.vf_coef, ent_coef=args.ent_coef, hidden=args.hidden, layers=args.layers,
-        init_log_std=args.init_log_std, squash=args.squash,
+        init_log_std=-0.5 if args.init_log_std is None else args.init_log_std, squash=args.squash,
         init_act_bias=[float(x) for x in args.init_bias.split(",")] if args.init_bias else None, obs_norm=not args.no_obs_norm,
         seed=args.seed, backend=args.backend)
     spec = env_spec(closed=closed, difficulty=difficulties[0], pool_size=args.pool,
@@ -188,6 +191,14 @@ def main(argv=None):
                                  venv.action_space.low, venv.action_space.high, cfg)
     cfg.backend = used
     trainer = PPOTrainer(cfg, venv, backend)
+    if args.init_from:
+        ck0 = load_pickle(args.init_from)
+        w0 = dict(ck0["weights"])
+        if args.init_log_std is not None:
+            w0["log_std"] = np.full((venv.action_space.shape[0],), args.init_log_std, np.float32)
+        backend.set_weights(w0)
+        trainer.obs_rms.load(ck0["obs_rms"])
+        print(f"warm start from {args.init_from}", flush=True)
     curriculum = Curriculum(difficulties, args.threshold, args.window, args.min_episodes, args.curriculum)
 
     latest = os.path.join(args.save_dir, "latest.pt")

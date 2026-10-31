@@ -475,3 +475,18 @@ def load_policy(path: str) -> NumpyPolicy:
     import pickle
     with open(path, "rb") as f:
         return NumpyPolicy(pickle.load(f))
+
+
+# --------------------------------------------------------------------------- export
+def export_npz(ck: dict, path: str) -> None:
+    """Write a checkpoint's weights and observation normaliser as a plain ``.npz`` (no pickle).
+
+    Keys: the weight names above, ``obs_mean``, ``obs_var``, and ``cfg_json`` (the PPO config as
+    a JSON string). Load with ``np.load(path)``; :func:`numpy_mlp` takes the weight dict directly.
+    """
+    import json
+    arrays = {k: np.asarray(v, np.float32) for k, v in ck["weights"].items()}
+    arrays["obs_mean"] = np.asarray(ck["obs_rms"]["mean"], np.float32)
+    arrays["obs_var"] = np.asarray(ck["obs_rms"]["var"], np.float32)
+    arrays["cfg_json"] = np.array(json.dumps(ck["cfg"]))
+    np.savez(path, **arrays)
