@@ -57,6 +57,19 @@ _MAX_SPEED = 150.0   # safety clamp on chassis speed [m/s]
 _MAX_OMEGA = 40.0    # safety clamp on chassis body angular rate [rad/s]
 _MIN_HUB_L = 0.02    # lower clamp on suspension length [m]
 _ABS_RATE = 25.0    # ABS brake-factor rate [1/s]
+# Inverted / on-side handling.  When the body up axis has world-z component Z2 <= _FLIP_Z2 the
+# suspension ray (along body -Z) cannot reach the ground, so wheels get no contact.  Instead the
+# body box corners below act as penalty contacts (spring-damper along the terrain normal, with
+# stick-slip friction).  Offsets are in body coordinates from the CoG [m].
+_FLIP_Z2 = 0.05
+_NO_RAY_L = 1e4     # suspension length reported when the ray has no ground intersection
+_BODY_BOX_Z = (-0.3, 0.85)              # underbody and roof heights above CoG [m]
+_BODY_BOX_HALF_W = 0.75                 # half width of the body box [m]
+_BODY_K = 1.0e6     # penalty stiffness of a body corner against the ground [N/m]
+_BODY_C = 2.5e4     # penalty damping along the ground normal [N s/m]
+_BODY_KT = 1.0e6    # tangential (stick) stiffness of a body contact [N/m]
+_BODY_CT = 2.0e3    # tangential damping of a body contact [N s/m]
+_BODY_MU = 0.7      # body-contact friction coefficient (scaled by terrain surface friction)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +336,13 @@ class Vehicle:
         self.travel = p.bump_travel
         self.kbs = p.bump_stop_rate
         self.Lmax = self.L0 + p.droop_travel
+        # body box corners (underbody and roof, at the axle lines) in body coordinates
+        zb, zr = _BODY_BOX_Z
+        self._box = (
+            (lf, lf, lf, lf, -lr, -lr, -lr, -lr),
+            tuple(s * _BODY_BOX_HALF_W for s in (1, -1, 1, -1, 1, -1, 1, -1)),
+            tuple(z for z in (zb, zb, zr, zr, zb, zb, zr, zr)),
+        )
         share = [front_share, front_share, 1 - front_share, 1 - front_share]
         self.Lstatic = [self.L0 - (W * share[i] / 2.0) / self.k[i] for i in range(4)]
         self._init_state()
@@ -345,6 +365,7 @@ class Vehicle:
         self.steer_act = 0.0
         self.wheel_steer = [0.0, 0.0, 0.0, 0.0]
         self.hub = [(0.0, 0.0, 0.0)] * 4
+        self._body_anchor = [None] * 8          # body-contact friction anchors (world points)
         self.a_local = [0.0, 0.0, 0.0]
         self.time = 0.0
         self.steps = 0
@@ -534,7 +555,10 @@ class Vehicle:
         nys = ng[:, 1].tolist()
         nzs = ng[:, 2].tolist()
 
-        zz = Z2 if Z2 > 0.05 else 0.05
+        # The ray along -Z only reaches the ground when Z2 > 0 (body up points up). When the body is
+        # inverted or on its side there is no wheel contact; the body box takes over below.
+        ray_ok = Z2 > _FLIP_Z2
+        zz = Z2 if ray_ok else 1.0
         Ln = [0.0] * 4
         Lraw = [0.0] * 4
         comp_c = [0.0] * 4
@@ -544,7 +568,7 @@ class Vehicle:
         for i in range(4):
             nzi = nzs[i] if nzs[i] > 0.2 else 0.2
             ground_z = hg[i] + R / nzi
-            L = (H[i][2] - ground_z) / zz
+            L = (H[i][2] - ground_z) / zz if ray_ok else _NO_RAY_L
             Lraw[i] = L
             Lmax = self.Lmax
             contact[i] = L <= Lmax
@@ -764,6 +788,80 @@ class Vehicle:
             Tq_x += ry * tfz - rz * tfy
             Tq_y += rz * tfx - rx * tfz
             Tq_z += rx * tfy - ry * tfx
+        # body-box penalty contacts, only when the body is inverted or on its side (no wheel ray)
+        if not ray_ok:
+            anchors = self._body_anchor
+            bxs, bys, bzs = self._box
+            Px = [px + a * X0 + b * Y0 + c * Z0 for a, b, c in zip(bxs, bys, bzs)]
+            Py = [py + a * X1 + b * Y1 + c * Z1 for a, b, c in zip(bxs, bys, bzs)]
+            Pz = [pz + a * X2 + b * Y2 + c * Z2 for a, b, c in zip(bxs, bys, bzs)]
+            qx = np.array(Px)
+            qy = np.array(Py)
+            gh = np.asarray(terrain.height_at(qx, qy), dtype=float).reshape(8).tolist()
+            gn = np.asarray(terrain.normal_at(qx, qy), dtype=float).reshape(8, 3).tolist()
+            gs = np.asarray(terrain.surface_at(qx, qy), dtype=float).reshape(8).tolist()
+            for k in range(8):
+                nx_, ny_, nz_ = gn[k]
+                # signed distance of the corner above the terrain plane through its ground point
+                dist = nx_ * (Px[k] - qx[k]) + ny_ * (Py[k] - qy[k]) + nz_ * (Pz[k] - gh[k])
+                if dist >= 0.0:
+                    anchors[k] = None
+                    continue
+                pen = -dist
+                rx, ry, rz = Px[k] - px, Py[k] - py, Pz[k] - pz
+                pvx = vx + (wy * rz - wz * ry)
+                pvy = vy + (wz * rx - wx * rz)
+                pvz = vz + (wx * ry - wy * rx)
+                vn = pvx * nx_ + pvy * ny_ + pvz * nz_
+                Fn = _BODY_K * pen - _BODY_C * vn
+                if Fn <= 0.0:
+                    anchors[k] = None
+                    continue
+                # stick-slip friction: a tangential spring to an anchor point (static friction),
+                # capped at mu * Fn (sliding friction); slipping moves the anchor
+                tvx = pvx - vn * nx_
+                tvy = pvy - vn * ny_
+                tvz = pvz - vn * nz_
+                an = anchors[k]
+                if an is None:
+                    an = (Px[k], Py[k], Pz[k])
+                dx_ = Px[k] - an[0]
+                dy_ = Py[k] - an[1]
+                dz_ = Pz[k] - an[2]
+                dn = dx_ * nx_ + dy_ * ny_ + dz_ * nz_
+                dx_ -= dn * nx_
+                dy_ -= dn * ny_
+                dz_ -= dn * nz_
+                sx_ = -(_BODY_KT * dx_ + _BODY_CT * tvx)
+                sy_ = -(_BODY_KT * dy_ + _BODY_CT * tvy)
+                sz_ = -(_BODY_KT * dz_ + _BODY_CT * tvz)
+                cap = _BODY_MU * gs[k] * Fn
+                ss = math.sqrt(sx_ * sx_ + sy_ * sy_ + sz_ * sz_)
+                if ss > cap:
+                    sc = cap / ss
+                    sx_ *= sc
+                    sy_ *= sc
+                    sz_ *= sc
+                    # slip: re-anchor so that the spring carries exactly the capped force
+                    ex_ = -(sx_ + _BODY_CT * tvx) / _BODY_KT
+                    ey_ = -(sy_ + _BODY_CT * tvy) / _BODY_KT
+                    ez_ = -(sz_ + _BODY_CT * tvz) / _BODY_KT
+                    anchors[k] = (Px[k] - ex_, Py[k] - ey_, Pz[k] - ez_)
+                else:
+                    anchors[k] = an
+                fx_ = Fn * nx_ + sx_
+                fy_ = Fn * ny_ + sy_
+                fz_ = Fn * nz_ + sz_
+                Fx_t += fx_
+                Fy_t += fy_
+                Fz_t += fz_
+                Tq_x += ry * fz_ - rz * fy_
+                Tq_y += rz * fx_ - rx * fz_
+                Tq_z += rx * fy_ - ry * fx_
+
+        else:
+            self._body_anchor = [None] * 8
+
         # aerodynamics and rolling (chassis-level part)
         speed = math.sqrt(vx * vx + vy * vy + vz * vz)
         qa = 0.5 * AIR_DENSITY

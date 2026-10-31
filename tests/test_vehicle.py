@@ -546,3 +546,118 @@ def test_speed_benchmark(capsys):
     rate = n / elapsed
     print(f"\nenv steps/s at dt=1/30, 120 Hz substeps (4 per step): {rate:.0f}")
     assert rate > 1000.0
+
+
+# ----------------------------------------------------------------- inverted / on-side bodies
+
+def _roll_pose(angle_deg: float):
+    """Quaternion (w, x, y, z) for a roll of ``angle_deg`` about the body X axis."""
+    a = math.radians(angle_deg) / 2
+    return [math.cos(a), math.sin(a), 0.0, 0.0]
+
+
+def _run_idle(v, terrain, seconds):
+    for _ in range(int(round(seconds / DT))):
+        v.step(Controls(), DT, terrain)
+
+
+def test_inverted_car_does_not_float_on_flat_ground():
+    """Regression: an upside-down car used to hover ~0.39 m up on phantom wheel contacts."""
+    t = FlatTerrain(0.0)
+    v = Vehicle(sports_car(), "auto")
+    v.reset((0.0, 0.0, 0.0), 0.0, t)
+    v.q = _roll_pose(180.0)
+    v.pos[2] += 1.0
+    _run_idle(v, t, 4.0)
+    assert not v.wheel_in_contact.any()
+    assert np.allclose(v.wheel_loads, 0.0)
+    assert v.position[2] < 0.9
+
+
+def test_inverted_car_dropped_from_1m_settles_on_roof():
+    t = FlatTerrain(0.0)
+    v = Vehicle(sports_car(), "auto")
+    v.reset((0.0, 0.0, 0.0), 0.0, t)
+    v.q = _roll_pose(180.0)
+    v.pos[2] += 1.0
+    zs = []
+    for i in range(int(round(12.0 / DT))):
+        v.step(Controls(), DT, t)
+        zs.append(v.position[2])
+        assert np.all(np.isfinite(v.position)) and np.all(np.isfinite(v.om))
+    # roof corners (body z = +0.85 m) rest on the ground: CoG about 0.85 m above it
+    assert 0.80 < v.position[2] < 0.90
+    assert abs(zs[-1] - zs[-30]) < 1e-3          # at rest, no jitter
+    assert np.linalg.norm(v.velocity_world) < 0.02
+    assert np.linalg.norm(v.angular_velocity) < 0.05
+    assert v.is_flipped()
+    assert not v.wheel_in_contact.any()
+
+
+def test_inverted_car_on_slope_comes_to_rest_on_roof():
+    t = SlopeTerrain(0.2)
+    v = Vehicle(sports_car(), "auto")
+    v.reset((0.0, 0.0, 0.0), 0.0, t)
+    v.q = _roll_pose(180.0)
+    v.pos[2] += 1.0
+    _run_idle(v, t, 12.0)
+    assert np.all(np.isfinite(v.position)) and np.all(np.isfinite(v.vel))
+    assert v.is_flipped()
+    assert np.linalg.norm(v.velocity_world) < 0.05
+    height = v.position[2] - float(t.height_at(np.array([v.position[0]]), np.array([v.position[1]]))[0])
+    assert 0.6 < height < 1.0                    # resting on the roof, not through the slope
+    # it lands and slides downhill while dropping, then friction (0.7) holds it on the 0.2 grade
+    assert -3.0 < v.position[0] < 0.5
+
+
+def test_car_on_its_side_settles_without_floating():
+    t = FlatTerrain(0.0)
+    v = Vehicle(sports_car(), "auto")
+    v.reset((0.0, 0.0, 0.0), 0.0, t)
+    v.q = _roll_pose(90.0)
+    v.pos[2] += 1.0
+    _run_idle(v, t, 12.0)
+    assert np.all(np.isfinite(v.position)) and np.all(np.isfinite(v.om))
+    assert np.linalg.norm(v.velocity_world) < 0.02
+    assert not v.wheel_in_contact.any()
+    assert 0.2 < v.position[2] < 0.8             # supported by the body box, not floating or sunk
+
+
+def test_normal_drive_trajectory_unchanged():
+    """Golden trajectory recorded before the inverted-body change (must match within 1e-9)."""
+    def drive(terrain):
+        v = Vehicle(sports_car(), "auto")
+        v.reset((0.0, 0.0, 0.0), 0.3, terrain)
+        rows = []
+        for i in range(900):
+            t_ = i / 30.0
+            c = Controls(steer=0.3 * math.sin(0.5 * t_), throttle=0.6 if t_ < 15 else 0.2,
+                         brake=0.0 if t_ < 20 else 0.5)
+            v.step(c, DT, terrain)
+            rows.append(np.concatenate([v.position, v.velocity_world, v.quaternion,
+                                        v.angular_velocity, v.wheel_speeds, v.wheel_loads]))
+        return np.array(rows)
+
+    flat = drive(FlatTerrain(0.0))
+    slope = drive(SlopeTerrain(0.05))
+    golden_flat_299 = [-12.53836824124184, 114.23554453919492, 0.529782263472623, 9.040830539290766,
+                       18.901187227689583, 0.0003105731964791135, 0.9311890434906124,
+                       -0.01746173423650507, -0.008988343316891075, 0.3640072290558386,
+                       0.000930361321859443, 0.0004917647119052505, -0.5750353009332936,
+                       58.5558776303612, 56.46555018454795, 68.36859367364639, 109.06071873164322,
+                       5276.5894409802695, 1015.8809130007267, 5005.3548402471915, 1658.5173500763237]
+    golden_flat_899 = [24.490127391343865, 118.34360392836102, 0.5310706463578976,
+                       -0.007677736766573233, 0.017416808193313607, -5.290910833482981e-05,
+                       -0.5723391408287191, 3.5352904620957894e-06, -1.3187986208739135e-05,
+                       -0.8200170167069842, 0.010917085627167072, 0.0076568238631486134,
+                       0.00044023460478665236, 0.0, 0.0, 0.0, 0.0, 3374.875146378644,
+                       3358.5441763956624, 3012.9603730729277, 2990.3982209592023]
+    golden_slope_899 = [90.60936426394548, 41.98552844116346, 5.062306856873493,
+                        -0.03942159285929948, 0.045908614237013666, -0.001927679554336452,
+                        0.8925825103255505, 0.011517622592117353, -0.022523096343160423,
+                        -0.45017387392193364, 0.008396561839106824, 0.008341213091441717,
+                        -0.0025329346535509704, 0.0, 0.0, 0.0, 0.0, 3199.1700477036147,
+                        3285.9895266868916, 3100.497976173589, 3168.7531839339536]
+    assert np.allclose(flat[299], golden_flat_299, rtol=0, atol=1e-9)
+    assert np.allclose(flat[899], golden_flat_899, rtol=0, atol=1e-9)
+    assert np.allclose(slope[899], golden_slope_899, rtol=0, atol=1e-9)
