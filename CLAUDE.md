@@ -24,13 +24,14 @@ Package `drivesim/` (one line per module):
 - `baselines.py`: `PurePursuitController`, `evaluate`, `main` (`python -m drivesim.baselines`).
 - `viewer.py`: numpy + pygame software 3D renderer, chase/hood/top cameras, `save_frames`.
 - `human.py`: `HumanInput`, `HumanTuning`, `DeviceReader`, `RawInput`; never imports pygame.
-- `rl/`: not present yet. RL training code is in progress elsewhere; check `git log` before assuming it exists.
+- `track_script.py`: scripted segment-based track builder (`TrackScript`, `NAMED_SCRIPTS` incl. `showcase`); see `drivesim/README_track_script.md`.
+- `rl/`: PPO training (`ppo.py` torch, `ppo_mlx.py` MLX, `vec_env.py`, `plot.py`) and the shipped DAgger-warm-started policy. See `rl/README_rl.md`.
 
 Other directories:
 
-- `scripts/`: `drive.py` (drive it yourself), `vehicle_demo.py` (writes a PNG), `preview_world.py` (writes a world PNG).
+- `scripts/`: `drive.py` (drive it yourself, `--track showcase` for the scripted circuit), `vehicle_demo.py` (writes a PNG), `preview_world.py` (writes a world PNG), `plot_showcase_track.py` (writes `docs/showcase_track.png`), `train.py` (PPO), `bc_pretrain.py` (behaviour cloning + DAgger warm start for PPO).
 - `tests/`: `conftest.py` plus `test_env`, `test_human`, `test_reward`, `test_vehicle`, `test_viewer`, `test_world`.
-- `drivesim/README_{world,vehicle,viewer,driving}.md`: design docs with API and limitations sections.
+- `drivesim/README_{world,vehicle,viewer,driving,track_script}.md`: design docs with API and limitations sections.
 - `.claude/`: SessionStart hook (`hooks/session-start.sh`) and `settings.json`.
 
 ## Setup and commands
@@ -50,16 +51,17 @@ Commands:
 ```bash
 python -m pytest                       # use `python -m pytest`, not bare `pytest` (may use a system Python without numpy)
 python -m pytest tests/test_env.py -q  # one file
-python -m pytest --co -q               # list tests (151 collected)
+python -m pytest --co -q               # list tests (237 collected)
 python scripts/drive.py                # drive yourself (keyboard/gamepad); --help lists flags
 python scripts/drive.py --headless-test 300 --no-viewer   # scripted smoke run, no window
+python scripts/drive.py --track showcase --headless-test 300 --no-viewer  # scripted showcase circuit
 python -m drivesim.baselines           # pure-pursuit baseline, 5 seeds x 3 difficulties x {loop, A->B}
 python -m drivesim.baselines --quick --mode discrete      # faster, 2 seeds, other action mode
 python scripts/vehicle_demo.py --out <png>             # vehicle scenarios to a PNG
 python scripts/preview_world.py <out.png> --seed 3     # world preview PNG
 ```
 
-Train/eval: no entry point exists yet. Do not invent one. Check `git log` and `drivesim/README_*.md`.
+Train/eval: `python scripts/train.py --help` (PPO; examples in its docstring), `python scripts/bc_pretrain.py` (DAgger warm start, writes a `train.py`-compatible checkpoint), `python scripts/plot_showcase_track.py` (layout PNG). Details in `drivesim/rl/README_rl.md`.
 
 ## Key conventions
 
@@ -95,8 +97,8 @@ Train/eval: no entry point exists yet. Do not invent one. Check `git log` and `d
 
 - Develop on `claude/confident-einstein-xqdtxy`. Do not work on the default branch.
 - Stage with explicit paths: `git add <paths>`. Never `git add -A` or `git add .`.
-- Never commit `.claude/worktrees/`. It is currently untracked and not in `.gitignore`, so keep it out of `git add`.
-- Ignored by `.gitignore`: `__pycache__/`, `*.pyc`, `.pytest_cache/`, `*.png`, `.venv/`. Generated PNG and output files stay uncommitted.
+- Never commit `.claude/worktrees/` (ignored by `.gitignore`; keep it out of `git add` anyway).
+- Ignored by `.gitignore`: `__pycache__/`, `*.pyc`, `.pytest_cache/`, `*.png`, `.venv/`, `.claude/worktrees/`. Generated PNG and output files stay uncommitted, except `docs/showcase_track.png`, which is tracked (force-added).
 - Do not open pull requests unless the user asks.
 - Pull and push: `git pull --rebase --autostash origin <branch>`, then `git push -u origin <branch>`.
 
